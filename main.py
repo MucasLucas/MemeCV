@@ -6,11 +6,16 @@ from contextlib import ExitStack
 from pathlib import Path
 import sys
 
+# OpenCV handles camera frames and display; MediaPipe detects landmarks;
+# NumPy handles the geometry (points, distances, and angles).
 import cv2
 import mediapipe as mp
 import numpy as np
 
 
+# TUNING PARAMETERS
+# These thresholds control how strict the gesture checks are. They are
+# measured in angles, normalized distances, or visibility scores.
 STABLE_FRAMES = 7
 POSE_VISIBILITY = 0.60
 FRAME_EDGE = 0.015
@@ -38,6 +43,7 @@ BECKON_OTHER_PIP = 156
 BECKON_OTHER_REACH = 0.98
 BECKON_MIN_OTHER_OPENNESS = 0.55
 
+# GESTURE OUTPUTS AND DISPLAY ASSETS
 WAITING = "Waiting for pose"
 ASSET_NAMES = {
     "Shrug": "IMG_5342.jpg",
@@ -49,6 +55,8 @@ ASSET_DIR = Path(__file__).resolve().parent / "assets" / "new"
 WEBCAM_WINDOW = "MemeCV — Webcam"
 REACTION_WINDOW = "MemeCV — Reaction"
 PINK = (180, 105, 255)
+# MediaPipe uses fixed landmark indexes. These groups select the points
+# needed for each check: shoulder -> elbow -> wrist, and face reference points.
 POSE = mp.solutions.pose.PoseLandmark
 ARM_NAMES = [
     (POSE.LEFT_SHOULDER, POSE.LEFT_ELBOW, POSE.LEFT_WRIST),
@@ -58,6 +66,9 @@ FACE_POINTS = (POSE.LEFT_EYE_OUTER, POSE.RIGHT_EYE_OUTER, POSE.NOSE)
 FINGERS = ((5, 6, 7, 8), (9, 10, 11, 12), (13, 14, 15, 16), (17, 18, 19, 20))
 
 
+# GEOMETRY HELPER
+# Returns the angle at `vertex` between the other two points, in degrees.
+# Joint angles help estimate whether fingers or arms are bent or straight.
 def angle(first, vertex, last):
     left, right = first - vertex, last - vertex
     length = np.linalg.norm(left) * np.linalg.norm(right)
@@ -66,9 +77,14 @@ def angle(first, vertex, last):
     return np.degrees(np.arccos(np.clip(np.dot(left, right) / length, -1, 1)))
 
 
+# HAND FEATURE EXTRACTION
+# MediaPipe returns 21 hand landmarks. This class turns them into useful
+# measurements so the gesture rules do not need to recalculate them each time.
 class Hand:
     def __init__(self, landmarks, aspect):
         # MediaPipe hand depth uses image-width units, as does x.
+        # MediaPipe x/y values are normalized to the image. Scale x (and z)
+        # by the image aspect ratio so distances are not distorted by frame shape.
         self.points = np.array([(p.x * aspect, p.y, p.z * aspect) for p in landmarks])
         self.width = max(np.linalg.norm(self.points[5] - self.points[17]), 1e-8)
         self.pip = []
@@ -80,12 +96,16 @@ class Hand:
             chain = np.linalg.norm(mcp - pip) + np.linalg.norm(pip - dip) + np.linalg.norm(dip - tip)
             self.reach.append(np.linalg.norm(tip - mcp) / max(chain, 1e-8))
 
+    # A finger is "extended" when its measured joint angles are sufficiently open.
     def extended(self, finger):
         return self.pip[finger] >= OPEN_PIP and self.dip[finger] >= OPEN_DIP
 
+    # A finger is "curled" when its joint angle and straight-line reach are small.
     def curled(self, finger):
         return self.pip[finger] <= CURLED_PIP and self.reach[finger] <= CURLED_REACH
 
+    # Estimates palm orientation from the wrist and two knuckle landmarks.
+    # The cross product gives a vector perpendicular to the palm surface.
     def palm_angled(self):
         # An unsigned normal tolerates both hands and mirror reversal.
         wrist = self.points[0]
@@ -94,6 +114,9 @@ class Hand:
         return length > 1e-8 and max(abs(normal[1]), abs(normal[2])) / length >= PALM_FACING_MIN
 
 
+# GESTURE CLASSIFIERS
+# These are rule-based checks: the program compares landmark geometry against
+# thresholds below. MediaPipe detects the landmarks; these functions name the gesture.
 def peace(hand):
     p = hand.points
     separation = np.linalg.norm(p[8] - p[12]) / hand.width
@@ -120,6 +143,9 @@ def beckon(hand):
             and max(hand.reach[1:]) >= BECKON_MIN_OTHER_OPENNESS)
 
 
+# LANDMARK VALIDATION
+# Pose landmarks include a visibility score. Reject points that are uncertain
+# or too close to the image edge before using them in a gesture calculation.
 def visible_points(landmarks, indices, aspect):
     result = []
     for i in indices:
@@ -132,6 +158,8 @@ def visible_points(landmarks, indices, aspect):
     return result
 
 
+# Checks whether both wrists are above the estimated top of the user's head.
+# Image y-coordinates increase downward, so a smaller y-value is higher in the frame.
 def hands_up(landmarks, arms, aspect):
     if arms is None:
         return False
@@ -149,6 +177,8 @@ def hands_up(landmarks, arms, aspect):
     )
 
 
+# Checks arm position/angles, then matches each detected hand to its wrist.
+# It tests both hand orderings because detection order is not guaranteed.
 def shrug(arms, hands):
     if arms is None or len(hands) != 2:
         return False
@@ -174,6 +204,9 @@ def shrug(arms, hands):
     return False
 
 
+# CLASSIFICATION / DECISION STAGE
+# Runs the gesture rules in priority order and returns one candidate label.
+# If no rule matches, the output remains "Waiting for pose".
 def candidate_for(pose, hands, aspect):
     arms = None
     if pose is not None:
@@ -192,6 +225,9 @@ def candidate_for(pose, hands, aspect):
     return WAITING
 
 
+# TEMPORAL FILTERING
+# A candidate is accepted only after the same label appears in 7 consecutive
+# frames. This helps prevent one-frame detection errors from changing the result.
 def confirm(history, candidate, previous):
     history.append(candidate)
     if len(history) == STABLE_FRAMES and all(value == candidate for value in history):
@@ -199,6 +235,7 @@ def confirm(history, candidate, previous):
     return previous
 
 
+# Loads reaction images once at startup and resizes oversized images for display.
 def load_reactions():
     reactions = {}
     for gesture, filename in ASSET_NAMES.items():
@@ -222,6 +259,7 @@ def load_reactions():
     return reactions
 
 
+# Tries available camera backends and checks that a real frame can be read.
 def open_camera(index):
     backends = (cv2.CAP_AVFOUNDATION, cv2.CAP_ANY) if sys.platform == "darwin" else (cv2.CAP_ANY,)
     for backend in backends:
@@ -238,6 +276,7 @@ def open_camera(index):
     raise RuntimeError("Could not open the camera or read a frame.")
 
 
+# DEBUG VISUALIZATION: draws detected landmark points on the webcam image.
 def draw_points(frame, landmarks, color):
     height, width = frame.shape[:2]
     for p in landmarks:
@@ -245,6 +284,9 @@ def draw_points(frame, landmarks, color):
             cv2.circle(frame, (int(p.x * width), int(p.y * height)), 2, color, -1, cv2.LINE_AA)
 
 
+# MAIN REAL-TIME PIPELINE
+# Startup -> read frame -> detect landmarks -> classify -> stabilize result
+# -> draw/display output. This loop repeats for every camera frame.
 def run(index, show_face):
     reactions = load_reactions()
     camera = None
@@ -262,14 +304,17 @@ def run(index, show_face):
             cv2.waitKey(1)
             while True:
                 frame = cv2.flip(frame, 1)
+                    # OpenCV frames use BGR channel order; MediaPipe expects RGB.
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 rgb.flags.writeable = False
+                # MediaPipe models return landmark coordinates for this frame.
                 pose = pose_model.process(rgb).pose_landmarks
                 hand_sets = hand_model.process(rgb).multi_hand_landmarks or []
                 aspect = frame.shape[1] / frame.shape[0]
                 hands = [Hand(result.landmark, aspect) for result in hand_sets
                          if all(FRAME_EDGE <= p.x <= 1 - FRAME_EDGE
                                 and FRAME_EDGE <= p.y <= 1 - FRAME_EDGE for p in result.landmark)]
+                # Turn raw landmarks into a candidate gesture, then filter it over time.
                 candidate = candidate_for(pose.landmark if pose else None, hands, aspect)
                 confirmed = confirm(history, candidate, confirmed)
                 if face_model:
@@ -296,6 +341,7 @@ def run(index, show_face):
             cv2.destroyAllWindows()
 
 
+# COMMAND-LINE ENTRY POINT: parses optional settings and starts the application.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--camera", type=int, default=0, help="webcam index (default: 0)")
